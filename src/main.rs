@@ -46,7 +46,7 @@ enum Polarity {
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(tag = "type")]
 enum ItemKind {
-    Feedback { polarity: Polarity },
+    Feedback { polarity: Polarity, output: Option<String> },
     Topic { output: Option<String> },
 }
 
@@ -54,7 +54,6 @@ enum ItemKind {
 struct Entry {
     text: String,
     kind: ItemKind,
-    discussed: bool,
 }
 
 /// One O3 meeting: belongs to a direct, has an optional date, and owns its entries.
@@ -192,20 +191,12 @@ impl App {
         } else {
             ItemKind::Feedback {
                 polarity: wizard.polarity.clone().unwrap_or(Polarity::Positive),
+                output: None,
             }
         };
         if let Some(o3) = self.o3s.get_mut(o3_idx) {
-            o3.entries.push(Entry { text: wizard.text.trim().to_string(), kind, discussed: false });
+            o3.entries.push(Entry { text: wizard.text.trim().to_string(), kind });
             self.save();
-        }
-    }
-
-    fn toggle_discussed(&mut self, o3_idx: usize, entry_idx: usize) {
-        if let Some(o3) = self.o3s.get_mut(o3_idx) {
-            if let Some(e) = o3.entries.get_mut(entry_idx) {
-                e.discussed = !e.discussed;
-                self.save();
-            }
         }
     }
 
@@ -222,10 +213,12 @@ impl App {
         let output = if text.trim().is_empty() { None } else { Some(text.trim().to_string()) };
         if let Some(o3) = self.o3s.get_mut(o3_idx) {
             if let Some(e) = o3.entries.get_mut(entry_idx) {
-                if let ItemKind::Topic { output: ref mut o } = e.kind {
-                    *o = output;
-                    self.save();
-                }
+                let slot = match &mut e.kind {
+                    ItemKind::Topic { output } => output,
+                    ItemKind::Feedback { output, .. } => output,
+                };
+                *slot = output;
+                self.save();
             }
         }
     }
@@ -341,18 +334,17 @@ fn handle_o3_detail(app: &mut App, code: KeyCode, o3_idx: usize, prev_list_selec
                 app.selected -= 1;
             }
         }
-        KeyCode::Enter => {
-            let sel = app.selected;
-            app.toggle_discussed(o3_idx, sel);
-        }
         KeyCode::Char('o') => {
             if let Some(o3) = app.o3s.get(o3_idx) {
                 if let Some(e) = o3.entries.get(app.selected) {
-                    if let ItemKind::Topic { output } = &e.kind {
-                        let existing = output.clone().unwrap_or_default();
-                        let cursor = existing.len();
+                    let existing = match &e.kind {
+                        ItemKind::Topic { output } => Some(output.clone().unwrap_or_default()),
+                        ItemKind::Feedback { output, .. } => Some(output.clone().unwrap_or_default()),
+                    };
+                    if let Some(text) = existing {
+                        let cursor = text.len();
                         let entry_idx = app.selected;
-                        app.mode = Mode::EditingOutput { o3_idx, entry_idx, text: existing, cursor };
+                        app.mode = Mode::EditingOutput { o3_idx, entry_idx, text, cursor };
                     }
                 }
             }
@@ -676,7 +668,7 @@ fn ui(f: &mut Frame, app: &App) {
                 f,
                 &text,
                 cursor,
-                " Topic output (Enter:save  Esc:cancel) ",
+                " Output (Enter:save  Esc:cancel) ",
                 Color::Cyan,
                 area,
             );
@@ -780,11 +772,10 @@ fn render_o3_detail(f: &mut Frame, app: &App, o3_idx: usize, area: Rect) {
     } else {
         for (i, entry) in o3.entries.iter().enumerate() {
             let selected = i == app.selected && matches!(app.mode, Mode::O3Detail { .. });
-            let dim = entry.discussed;
 
             let (prefix, accent) = match &entry.kind {
-                ItemKind::Feedback { polarity: Polarity::Positive } => ("[+]", Color::Green),
-                ItemKind::Feedback { polarity: Polarity::Negative } => ("[-]", Color::Red),
+                ItemKind::Feedback { polarity: Polarity::Positive, .. } => ("[+]", Color::Green),
+                ItemKind::Feedback { polarity: Polarity::Negative, .. } => ("[-]", Color::Red),
                 ItemKind::Topic { .. } => ("[T]", Color::Cyan),
             };
 
@@ -792,18 +783,12 @@ fn render_o3_detail(f: &mut Frame, app: &App, o3_idx: usize, area: Rect) {
 
             let pfx_style = if selected {
                 Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-            } else if dim {
-                Style::default().fg(Color::DarkGray)
             } else {
                 Style::default().fg(accent)
             };
 
             let txt_style = if selected {
                 Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-            } else if dim {
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::CROSSED_OUT)
             } else {
                 Style::default()
             };
@@ -815,11 +800,16 @@ fn render_o3_detail(f: &mut Frame, app: &App, o3_idx: usize, area: Rect) {
                 Span::styled(entry.text.as_str(), txt_style),
             ])));
 
-            if let ItemKind::Topic { output: Some(out) } = &entry.kind {
+            let out = match &entry.kind {
+                ItemKind::Topic { output: Some(o) } => Some(o.as_str()),
+                ItemKind::Feedback { output: Some(o), .. } => Some(o.as_str()),
+                _ => None,
+            };
+            if let Some(out) = out {
                 items.push(ListItem::new(Line::from(vec![
                     Span::raw("       └ "),
                     Span::styled(
-                        out.as_str(),
+                        out,
                         Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
                     ),
                 ])));
@@ -831,7 +821,7 @@ fn render_o3_detail(f: &mut Frame, app: &App, o3_idx: usize, area: Rect) {
         .block(Block::default().borders(Borders::ALL).title(title));
     f.render_widget(list, chunks[0]);
 
-    let help = "a:add  t:set date  j/k:↑↓  Enter:toggle discussed  o:output  d:delete  Esc:back  q:quit";
+    let help = "a:add  t:set date  j/k:↑↓  o:output  d:delete  Esc:back  q:quit";
     f.render_widget(help_bar(help), chunks[1]);
 }
 
